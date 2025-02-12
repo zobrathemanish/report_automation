@@ -2,3 +2,4 @@ Flask
 Werkzeug
 pandas
 python-docx
+gunicorn
