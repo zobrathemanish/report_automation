@@ -6,12 +6,12 @@ from threading import Thread
 from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, render_template_string
 from werkzeug.utils import secure_filename
 from docx import Document
-from docx.enum.text import WD_COLOR_INDEX, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.shared import Pt
+from docx.enum.text import WD_COLOR_INDEX
 
 app = Flask(__name__)
 
-# Set up directories for uploads and outputs.
+# Configure upload and output directories.
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['OUTPUT_FOLDER'] = 'outputs'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -23,108 +23,174 @@ progress_data = {
     'output_filename': None
 }
 
-def process_files(excel_filepath, word_filepath, highlight_flag):
+# Helper function to capture formatting from a run.
+def get_run_formatting(run):
+    fmt = {
+        'bold': run.font.bold,
+        'italic': run.font.italic,
+        'underline': run.font.underline,
+        'size': run.font.size,
+        'name': run.font.name,
+        'color': run.font.color.rgb if run.font.color and run.font.color.rgb else None,
+        # You can add more formatting properties if needed.
+    }
+    return fmt
+
+# Helper function to apply formatting to a target run.
+def apply_formatting(target_run, fmt):
+    target_run.font.bold = fmt.get('bold')
+    target_run.font.italic = fmt.get('italic')
+    target_run.font.underline = fmt.get('underline')
+    target_run.font.size = fmt.get('size')
+    target_run.font.name = fmt.get('name')
+    if fmt.get('color'):
+        target_run.font.color.rgb = fmt.get('color')
+
+# --------------------------
+# Processing Function
+# --------------------------
+def process_files(excel_path, word_path, highlight_flag):
     """
-    Processes the two files:
-      1. Reads the Excel file and builds a dictionary of placeholder values.
-      2. Loads the Word template.
-      3. Replaces placeholders with their values. If highlight_flag is True, only the replaced text is highlighted.
-      4. Sets paragraph-level formatting:
-         - Alignment: Justified
-         - Space Before: 0 pt
-         - Space After: 12 pt
-         - Line Spacing: Exactly 16 pt
-      5. Saves the output file.
+    Follows the notebook structure:
+      1. Load Excel data.
+      2. Load the Word template.
+      3. Replace placeholders while preserving run formatting.
+      4. Add notifications if there are mismatches.
+      5. Save the generated report.
     """
     try:
-        # --- Step 1: Load Excel Data ---
+        # --------------------------
+        # 1. Load Excel Data
+        # --------------------------
         progress_data['progress'] = 10
-        df = pd.read_excel(excel_filepath, sheet_name=1)
+        df = pd.read_excel(excel_path, sheet_name=1)  # Read second sheet
         df.rename(columns=lambda x: x.strip(), inplace=True)
-        if "Metric" not in df.columns or "Value" not in df.columns:
-            progress_data['progress'] = 100
-            return
-        # Build dictionary mapping each Metric to its Value (as a stripped string)
-        stats_dict = df.set_index('Metric')['Value'].astype(str).to_dict()
-        stats_dict = {key.strip(): value.strip() for key, value in stats_dict.items()}
-        time.sleep(1)  # Simulate processing delay.
+
+        # Check for required columns.
+        missing_columns = []
+        if "Metric" not in df.columns:
+            missing_columns.append("Metric")
+        if "Value" not in df.columns:
+            missing_columns.append("Value")
+            
+        if missing_columns:
+            print("Missing required column(s):", missing_columns)
+            stats_dict = {}  # Proceed with an empty dictionary
+        else:
+            stats_dict = df.set_index('Metric')['Value'].astype(str).to_dict()
+            # Convert both keys and values to strings before stripping.
+            stats_dict = {str(key).strip(): str(value).strip() for key, value in stats_dict.items()}
+
+        print("✅ Cleaned Dictionary Keys:", stats_dict.keys())
+        time.sleep(1)
         progress_data['progress'] = 30
 
-        # --- Step 2: Load Word Template ---
-        doc = Document(word_filepath)
+        # --------------------------
+        # 2. Load the Word Template
+        # --------------------------
+        doc = Document(word_path)
         time.sleep(1)
         progress_data['progress'] = 40
 
-        # --- Step 3: Replace placeholders and set paragraph formatting ---
-        def replace_placeholders_in_docx(doc, replacements, highlight_replacements=False):
-            """
-            Replaces placeholders of the form {{ key }} with corresponding values.
-            After rebuilding each paragraph, sets:
-              - Justified alignment
-              - 0 pt before, 12 pt after spacing
-              - Exactly 16 pt line spacing
-            """
-            placeholder_pattern = re.compile(r"{{\s*(.*?)\s*}}")
-            for para in doc.paragraphs:
-                original_text = para.text
-                # If no placeholders found, still apply the paragraph formatting.
-                if not placeholder_pattern.search(original_text):
-                    para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                    para.paragraph_format.space_before = Pt(0)
-                    para.paragraph_format.space_after = Pt(12)
-                    para.paragraph_format.line_spacing = Pt(16)
-                    para.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
-                    continue
+        # --------------------------
+        # 3. Extract Placeholders (for diagnostics)
+        # --------------------------
+        def extract_placeholders(document):
+            placeholders = set()
+            pattern = re.compile(r"{{\s*(.*?)\s*}}")
+            for para in document.paragraphs:
+                matches = pattern.findall(para.text)
+                placeholders.update(matches)
+            return placeholders
 
-                # Remove all runs in the paragraph.
-                p_xml = para._element
-                for child in list(p_xml):
-                    p_xml.remove(child)
+        doc_placeholders = extract_placeholders(doc)
+        print("🔍 Placeholders in Template:", doc_placeholders)
+        missing_in_excel = doc_placeholders - set(stats_dict.keys())
+        if missing_in_excel:
+            print("⚠️ The following placeholders exist in the template but NOT in Excel:")
+            print(missing_in_excel)
+        missing_in_doc = set(stats_dict.keys()) - doc_placeholders
+        if missing_in_doc:
+            print("⚠️ The following Excel keys exist but are NOT used in the template:")
+            print(missing_in_doc)
 
-                current_index = 0
-                # Process each placeholder occurrence.
-                for match in placeholder_pattern.finditer(original_text):
-                    start, end = match.span()
-                    # Add text before the placeholder as a normal run.
-                    if start > current_index:
-                        pre_text = original_text[current_index:start]
-                        para.add_run(pre_text)
-                    key = match.group(1).strip()
-                    if key in replacements:
-                        replacement_value = replacements[key]
-                        new_run = para.add_run(replacement_value)
-                        if highlight_replacements:
-                            new_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+        # --------------------------
+        # 4. Replacement Function (Preserving Run Formatting)
+        # --------------------------
+        def replace_placeholders_in_docx(document, replacements, apply_highlight=False):
+            """
+            Processes each paragraph and run. For each run, splits its text around placeholders of
+            the form {{ key }}. For each text segment, a new run is created that inherits the original
+            run’s formatting (bold, italic, size, color, etc.). If a segment is a replacement and
+            highlighting is enabled, the run is highlighted.
+            """
+            pattern = re.compile(r"{{\s*(.*?)\s*}}")
+            for para in document.paragraphs:
+                new_runs = []  # List of tuples: (text, is_replaced, formatting dict)
+                for run in para.runs:
+                    fmt = get_run_formatting(run)
+                    text = run.text
+                    last_index = 0
+                    if not pattern.search(text):
+                        new_runs.append((text, False, fmt))
                     else:
-                        # No replacement found; add the placeholder back.
-                        para.add_run(match.group(0))
-                    current_index = end
-                # Add any remaining text after the last placeholder.
-                if current_index < len(original_text):
-                    para.add_run(original_text[current_index:])
+                        for match in pattern.finditer(text):
+                            start, end = match.span()
+                            key = match.group(1).strip()
+                            # Append text before the placeholder.
+                            if start > last_index:
+                                new_runs.append((text[last_index:start], False, fmt))
+                            # Append the replacement value if found.
+                            if key in replacements:
+                                new_runs.append((replacements[key], True, fmt))
+                            else:
+                                new_runs.append((match.group(0), False, fmt))
+                            last_index = end
+                        # Append any remaining text.
+                        if last_index < len(text):
+                            new_runs.append((text[last_index:], False, fmt))
+                # Remove all existing runs.
+                for run in para.runs:
+                    run.text = ""
+                # Rebuild the paragraph with new runs, applying formatting.
+                for seg_text, is_replaced, fmt in new_runs:
+                    new_run = para.add_run(seg_text)
+                    apply_formatting(new_run, fmt)
+                    if is_replaced and apply_highlight:
+                        new_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
 
-                # Now apply the desired paragraph formatting.
-                para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                para.paragraph_format.space_before = Pt(0)
-                para.paragraph_format.space_after = Pt(12)
-                para.paragraph_format.line_spacing = Pt(16)
-                para.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+        replace_placeholders_in_docx(doc, stats_dict, apply_highlight=highlight_flag)
 
-        replace_placeholders_in_docx(doc, stats_dict, highlight_flag)
+        # --------------------------
+        # 5. Add Notification Paragraphs (if mismatches exist)
+        # --------------------------
+        if missing_in_excel:
+            note = ("Note: The following placeholders were not found in the Excel file: " +
+                    ", ".join(missing_in_excel))
+            doc.add_paragraph(note)
+        if missing_in_doc:
+            note2 = ("Note: The following keys from the Excel file were not used in the template: " +
+                     ", ".join(missing_in_doc))
+            doc.add_paragraph(note2)
+
         time.sleep(1)
         progress_data['progress'] = 80
 
-        # --- Step 4: Save the generated report ---
+        # --------------------------
+        # 6. Save the Generated Report
+        # --------------------------
         output_filename = "generated_report.docx"
         output_filepath = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         doc.save(output_filepath)
         time.sleep(1)
         progress_data['progress'] = 100
         progress_data['output_filename'] = output_filename
+        print(f"✅ Report generated successfully: {output_filepath}")
 
     except Exception as e:
         progress_data['progress'] = 100
         print("Error processing files:", e)
+
 
 # -------------------------
 # Flask Routes
@@ -132,7 +198,7 @@ def process_files(excel_filepath, word_filepath, highlight_flag):
 
 @app.route('/', methods=['GET', 'POST'])
 def upload_files():
-    """Upload form with a checkbox to indicate whether to highlight replaced text."""
+    """Upload form to provide an Excel file and a Word template. Optionally enable highlighting."""
     if request.method == 'POST':
         if 'excel_file' not in request.files or 'word_file' not in request.files:
             return "Missing file(s)", 400
@@ -151,10 +217,10 @@ def upload_files():
         excel_file.save(excel_path)
         word_file.save(word_path)
 
-        # Determine if the checkbox for highlighting is checked.
+        # Determine if highlighting is enabled.
         highlight_flag = request.form.get("highlight") in ["true", "on"]
 
-        # Reset progress info.
+        # Reset progress information.
         progress_data['progress'] = 0
         progress_data['output_filename'] = None
 
@@ -164,7 +230,7 @@ def upload_files():
 
         return redirect(url_for('progress_page'))
 
-    # GET: Render the upload form with Bootstrap styling.
+    # GET: Render the upload form.
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -179,17 +245,17 @@ def upload_files():
           <h1 class="mb-4">Upload Excel Data and Word Template</h1>
           <form method="post" enctype="multipart/form-data">
             <div class="mb-3">
-              <label for="excel_file" class="form-label">Current Johnson Data Excel File</label>
+              <label for="excel_file" class="form-label">Excel File (.xlsx, .xls)</label>
               <input class="form-control" type="file" name="excel_file" id="excel_file" accept=".xlsx,.xls">
             </div>
             <div class="mb-3">
-              <label for="word_file" class="form-label">Word Template</label>
+              <label for="word_file" class="form-label">Word Template (.docx)</label>
               <input class="form-control" type="file" name="word_file" id="word_file" accept=".docx">
             </div>
             <div class="form-check mb-3">
               <input class="form-check-input" type="checkbox" value="true" id="highlight" name="highlight">
               <label class="form-check-label" for="highlight">
-                Highlight Replaced Values
+                Highlight replaced values
               </label>
             </div>
             <button type="submit" class="btn btn-primary">Submit</button>
@@ -202,7 +268,7 @@ def upload_files():
 
 @app.route('/progress_page')
 def progress_page():
-    """Display a progress bar and, when complete, a download button."""
+    """Display a progress bar and show a download button when processing is complete."""
     return render_template_string('''
     <!doctype html>
     <html lang="en">
@@ -253,7 +319,7 @@ def progress():
 
 @app.route('/download')
 def download():
-    """Send the generated output file to the user."""
+    """Send the generated file to the user."""
     if progress_data['output_filename']:
         return send_from_directory(app.config['OUTPUT_FOLDER'],
                                    progress_data['output_filename'],
