@@ -1,0 +1,4 @@
+Flask
+Werkzeug
+pandas
+python-docx
