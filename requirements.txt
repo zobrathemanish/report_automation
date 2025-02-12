@@ -3,3 +3,4 @@ Werkzeug
 pandas
 python-docx
 gunicorn
+openpyxl
